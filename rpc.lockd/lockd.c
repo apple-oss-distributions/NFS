@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2002-2009 Apple Inc.  All rights reserved.
+ * Copyright (c) 2002-2010 Apple Inc.  All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  * 
@@ -70,7 +70,6 @@ __RCSID("$NetBSD: lockd.c,v 1.7 2000/08/12 18:08:44 thorpej Exp $");
 
 /* make sure we can handle lots of file descriptors */
 #include <sys/syslimits.h>
-#define FD_SETSIZE OPEN_MAX
 #define _DARWIN_UNLIMITED_SELECT
 
 #include <sys/types.h>
@@ -93,12 +92,12 @@ __RCSID("$NetBSD: lockd.c,v 1.7 2000/08/12 18:08:44 thorpej Exp $");
 #include <libutil.h>
 #include <launch.h>
 
-#include <rpc/rpc.h>
-#include <rpc/pmap_clnt.h>
-#include <rpcsvc/sm_inter.h>
+#include <oncrpc/rpc.h>
+#include <oncrpc/pmap_clnt.h>
+#include "sm_inter.h"
 
 #include "lockd.h"
-#include <rpcsvc/nlm_prot.h>
+#include "nlm_prot.h"
 
 int bindresvport_sa(int sd, struct sockaddr *sa);
 
@@ -111,13 +110,19 @@ const struct nfs_conf_lockd config_defaults =
 	45,		/* grace_period */
 	60,		/* host_monitor_cache_timeout */
 	0,		/* port */
+	0,		/* send_using_tcp */
 	180,		/* shutdown_delay_client */
 	180,		/* shutdown_delay_server */
+	1,		/* tcp */
+	1,		/* udp */
 	0,		/* verbose */
 };
 struct nfs_conf_lockd config;
 
+int lockudpsock, locktcpsock;
+int lockudp6sock, locktcp6sock;
 int udpport, tcpport;
+int udp6port, tcp6port;
 int grace_expired;
 int nsm_state;
 pid_t server_pid = -1;
@@ -139,8 +144,6 @@ void my_svc_run(void);
 static int statd_is_loaded(void);
 static int statd_load(void);
 static int statd_service_start(void);
-
-const char *transports[] = { "udp", "tcp", "udp6", "tcp6" };
 
 
 /*
@@ -181,9 +184,11 @@ main(argc, argv)
 	char **argv;
 {
 	SVCXPRT *transp;
-	struct sockaddr_in inetaddr;
+	struct sockaddr_storage saddr;
+	struct sockaddr_in *sin = (struct sockaddr_in*)&saddr;
+	struct sockaddr_in6 *sin6 = (struct sockaddr_in6*)&saddr;
 	socklen_t socklen;
-	int ch, sockfd, rv;
+	int ch, rv, on = 1, svcregcnt;
 	struct sigaction sa;
 	struct rlimit rlp;
 	pid_t child, pid;
@@ -272,7 +277,7 @@ main(argc, argv)
 	switch (child = fork()) {
 	case -1:
 		syslog(LOG_ERR, "Could not fork server");
-		handle_sig_cleanup(0);
+		handle_sig_cleanup(SIGQUIT);
 		/*NOTREACHED*/
 	case 0:
 		/* Server doesn't need to block */
@@ -285,101 +290,275 @@ main(argc, argv)
 		sigwait(&waitset, &server_sig);
 		if (server_sig != SIGUSR1) {
 			syslog(LOG_ERR, "Lockd got unexpected signal %d\n", server_sig);
-			handle_sig_cleanup(0);
+			handle_sig_cleanup(SIGQUIT);
 		}
 		sigprocmask(SIG_SETMASK, &osigset, NULL); /* Reset signal mask */
 		client_mach_request();
 		/* We should never return, but if we do kill our other half */
 		syslog(LOG_ERR,	"Lockd: client_mach_request(), returned unexpectedly");
-		handle_sig_cleanup(0);
+		handle_sig_cleanup(SIGQUIT);
 		/*NOTREACHED*/
 	}
 
 	/* We're the child and the server */
+	lockudpsock = locktcpsock = -1;
+	lockudp6sock = locktcp6sock = -1;
 
-	pmap_unset(NLM_PROG, NLM_SM);
-	pmap_unset(NLM_PROG, NLM_VERS);
-	pmap_unset(NLM_PROG, NLM_VERSX);
-	pmap_unset(NLM_PROG, NLM_VERS4);
+	rpcb_unset(NULL, NLM_PROG, NLM_SM);
+	rpcb_unset(NULL, NLM_PROG, NLM_VERS);
+	rpcb_unset(NULL, NLM_PROG, NLM_VERSX);
+	rpcb_unset(NULL, NLM_PROG, NLM_VERS4);
 
 	/* parent cleans up the pid file */
 	pfh = NULL;
 
-	if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-		syslog(LOG_ERR, "can't create UDP socket: %s (%d)", strerror(errno), errno);
-		exit(1);
-	}
-	inetaddr.sin_family = AF_INET;
-	inetaddr.sin_addr.s_addr = INADDR_ANY;
-	inetaddr.sin_port = htons(config.port);
-	inetaddr.sin_len = sizeof(inetaddr);
-	if (bindresvport_sa(sockfd, (struct sockaddr *) &inetaddr) < 0) {
-		syslog(LOG_ERR, "can't bind UDP addr: %s (%d)", strerror(errno), errno);
-		exit(1);
-	}
-	socklen = sizeof(inetaddr);
-	if (getsockname(sockfd, (struct sockaddr *) &inetaddr, &socklen))
-		syslog(LOG_ERR, "can't getsockname on UDP socket: %s (%d)", strerror(errno), errno);
-	else
-		udpport = ntohs(inetaddr.sin_port);
-	transp = svcudp_create(sockfd);
-	if (transp == NULL) {
-		syslog(LOG_ERR, "cannot create UDP service");
-		exit(1);
-	}
-	if (!svc_register(transp, NLM_PROG, NLM_SM, nlm_prog_0, IPPROTO_UDP)) {
-		syslog(LOG_ERR, "unable to register (NLM_PROG, NLM_SM, udp)");
-		exit(1);
-	}
-	if (!svc_register(transp, NLM_PROG, NLM_VERS, nlm_prog_1, IPPROTO_UDP)) {
-		syslog(LOG_ERR, "unable to register (NLM_PROG, NLM_VERS, udp)");
-		exit(1);
-	}
-	if (!svc_register(transp, NLM_PROG, NLM_VERSX, nlm_prog_3, IPPROTO_UDP)) {
-		syslog(LOG_ERR, "unable to register (NLM_PROG, NLM_VERSX, udp)");
-		exit(1);
-	}
-	if (!svc_register(transp, NLM_PROG, NLM_VERS4, nlm_prog_4, IPPROTO_UDP)) {
-		syslog(LOG_ERR, "unable to register (NLM_PROG, NLM_VERS4, udp)");
-		exit(1);
+	if (config.udp) {
+
+		/* IPv4 */
+		if ((lockudpsock = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
+			syslog(LOG_ERR, "can't create UDP IPv4 socket: %s (%d)", strerror(errno), errno);
+		if (lockudpsock >= 0) {
+			sin->sin_family = AF_INET;
+			sin->sin_addr.s_addr = INADDR_ANY;
+			sin->sin_port = htons(config.port);
+			sin->sin_len = sizeof(*sin);
+			if (bindresvport_sa(lockudpsock, (struct sockaddr *)sin) < 0) {
+				/* socket may still be lingering from previous incarnation */
+				/* wait a few seconds and try again */
+				sleep(6);
+				if (bindresvport_sa(lockudpsock, (struct sockaddr *)sin) < 0) {
+					syslog(LOG_ERR, "can't bind UDP IPv4 addr: %s (%d)", strerror(errno), errno);
+					close(lockudpsock);
+					lockudpsock = -1;
+				}
+			}
+		}
+		if (lockudpsock >= 0) {
+			socklen = sizeof(*sin);
+			if (getsockname(lockudpsock, (struct sockaddr *)sin, &socklen)) {
+				syslog(LOG_ERR, "can't getsockname on UDP IPv4 socket: %s (%d)", strerror(errno), errno);
+				close(lockudpsock);
+				lockudpsock = -1;
+			} else {
+				udpport = ntohs(sin->sin_port);
+			}
+		}
+		if ((lockudpsock >= 0) && ((transp = svcudp_create(lockudpsock)) == NULL)) {
+			syslog(LOG_ERR, "cannot create UDP IPv4 service");
+			close(lockudpsock);
+			lockudpsock = -1;
+		}
+		if (lockudpsock >= 0) {
+			svcregcnt = 0;
+			if (!svc_register(transp, NLM_PROG, NLM_SM, nlm_prog_0, IPPROTO_UDP))
+				syslog(LOG_ERR, "unable to register IPv4 (NLM_PROG, NLM_SM, udp)");
+			else
+				svcregcnt++;
+			if (!svc_register(transp, NLM_PROG, NLM_VERS, nlm_prog_1, IPPROTO_UDP))
+				syslog(LOG_ERR, "unable to register IPv4 (NLM_PROG, NLM_VERS, udp)");
+			else
+				svcregcnt++;
+			if (!svc_register(transp, NLM_PROG, NLM_VERSX, nlm_prog_3, IPPROTO_UDP))
+				syslog(LOG_ERR, "unable to register IPv4 (NLM_PROG, NLM_VERSX, udp)");
+			else
+				svcregcnt++;
+			if (!svc_register(transp, NLM_PROG, NLM_VERS4, nlm_prog_4, IPPROTO_UDP))
+				syslog(LOG_ERR, "unable to register IPv4 (NLM_PROG, NLM_VERS4, udp)");
+			else
+				svcregcnt++;
+			if (!svcregcnt) {
+				svc_destroy(transp);
+				close(lockudpsock);
+				lockudpsock = -1;
+			}
+		}
+
+		/* IPv6 */
+		if ((lockudp6sock = socket(AF_INET6, SOCK_DGRAM, 0)) < 0)
+			syslog(LOG_ERR, "can't create UDP IPv6 socket: %s (%d)", strerror(errno), errno);
+		if (lockudp6sock >= 0) {
+			setsockopt(lockudp6sock, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on));
+			sin6->sin6_family = AF_INET6;
+			sin6->sin6_addr = in6addr_any;
+			sin6->sin6_port = htons(config.port);
+			sin6->sin6_len = sizeof(*sin6);
+			if (bindresvport_sa(lockudp6sock, (struct sockaddr *)sin6) < 0) {
+				/* socket may still be lingering from previous incarnation */
+				/* wait a few seconds and try again */
+				sleep(6);
+				if (bindresvport_sa(lockudp6sock, (struct sockaddr *)sin6) < 0) {
+					syslog(LOG_ERR, "can't bind UDP IPv6 addr: %s (%d)", strerror(errno), errno);
+					close(lockudp6sock);
+					lockudp6sock = -1;
+				}
+			}
+		}
+		if (lockudp6sock >= 0) {
+			socklen = sizeof(*sin6);
+			if (getsockname(lockudp6sock, (struct sockaddr *)sin6, &socklen)) {
+				syslog(LOG_ERR, "can't getsockname on UDP IPv6 socket: %s (%d)", strerror(errno), errno);
+				close(lockudp6sock);
+				lockudp6sock = -1;
+			} else {
+				udp6port = ntohs(sin6->sin6_port);
+			}
+		}
+		if ((lockudp6sock >= 0) && ((transp = svcudp_create(lockudp6sock)) == NULL)) {
+			syslog(LOG_ERR, "cannot create UDP IPv6 service");
+			close(lockudp6sock);
+			lockudp6sock = -1;
+		}
+		if (lockudp6sock >= 0) {
+			svcregcnt = 0;
+			if (!svc_register(transp, NLM_PROG, NLM_SM, nlm_prog_0, IPPROTO_UDP))
+				syslog(LOG_ERR, "unable to register IPv6 (NLM_PROG, NLM_SM, udp)");
+			else
+				svcregcnt++;
+			if (!svc_register(transp, NLM_PROG, NLM_VERS, nlm_prog_1, IPPROTO_UDP))
+				syslog(LOG_ERR, "unable to register IPv6 (NLM_PROG, NLM_VERS, udp)");
+			else
+				svcregcnt++;
+			if (!svc_register(transp, NLM_PROG, NLM_VERSX, nlm_prog_3, IPPROTO_UDP))
+				syslog(LOG_ERR, "unable to register IPv6 (NLM_PROG, NLM_VERSX, udp)");
+			else
+				svcregcnt++;
+			if (!svc_register(transp, NLM_PROG, NLM_VERS4, nlm_prog_4, IPPROTO_UDP))
+				syslog(LOG_ERR, "unable to register IPv6 (NLM_PROG, NLM_VERS4, udp)");
+			else
+				svcregcnt++;
+			if (!svcregcnt) {
+				svc_destroy(transp);
+				close(lockudp6sock);
+				lockudp6sock = -1;
+			}
+		}
+
 	}
 
-	if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-		syslog(LOG_ERR, "can't create TCP socket: %s (%d)", strerror(errno), errno);
-		exit(1);
+	if (config.tcp) {
+
+		/* IPv4 */
+		if ((locktcpsock = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+			syslog(LOG_ERR, "can't create TCP IPv4 socket: %s (%d)", strerror(errno), errno);
+		if (locktcpsock >= 0) {
+			if (setsockopt(locktcpsock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0)
+				syslog(LOG_WARNING, "setsockopt TCP IPv4 SO_REUSEADDR: %s (%d)", strerror(errno), errno);
+			sin->sin_family = AF_INET;
+			sin->sin_addr.s_addr = INADDR_ANY;
+			sin->sin_port = htons(config.port);
+			sin->sin_len = sizeof(*sin);
+			if (bindresvport_sa(locktcpsock, (struct sockaddr *)sin) < 0) {
+				syslog(LOG_ERR, "can't bind TCP IPv4 addr: %s (%d)", strerror(errno), errno);
+				close(locktcpsock);
+				locktcpsock = -1;
+			}
+		}
+		if (locktcpsock >= 0) {
+			socklen = sizeof(*sin);
+			if (getsockname(locktcpsock, (struct sockaddr *)sin, &socklen)) {
+				syslog(LOG_ERR, "can't getsockname on TCP IPv4 socket: %s (%d)", strerror(errno), errno);
+				close(locktcpsock);
+				locktcpsock = -1;
+			} else {
+				tcpport = ntohs(sin->sin_port);
+			}
+		}
+		if ((locktcpsock >= 0) && ((transp = svctcp_create(locktcpsock, 0, 0)) == NULL)) {
+			syslog(LOG_ERR, "cannot create TCP IPv4 service");
+			close(locktcpsock);
+			locktcpsock = -1;
+		}
+		if (locktcpsock >= 0) {
+			svcregcnt = 0;
+			if (!svc_register(transp, NLM_PROG, NLM_SM, nlm_prog_0, IPPROTO_TCP))
+				syslog(LOG_ERR, "unable to register IPv4 (NLM_PROG, NLM_SM, tcp)");
+			else
+				svcregcnt++;
+			if (!svc_register(transp, NLM_PROG, NLM_VERS, nlm_prog_1, IPPROTO_TCP))
+				syslog(LOG_ERR, "unable to register IPv4 (NLM_PROG, NLM_VERS, tcp)");
+			else
+				svcregcnt++;
+			if (!svc_register(transp, NLM_PROG, NLM_VERSX, nlm_prog_3, IPPROTO_TCP))
+				syslog(LOG_ERR, "unable to register IPv4 (NLM_PROG, NLM_VERSX, tcp)");
+			else
+				svcregcnt++;
+			if (!svc_register(transp, NLM_PROG, NLM_VERS4, nlm_prog_4, IPPROTO_TCP))
+				syslog(LOG_ERR, "unable to register IPv4 (NLM_PROG, NLM_VERS4, tcp)");
+			else
+				svcregcnt++;
+			if (!svcregcnt) {
+				svc_destroy(transp);
+				close(locktcpsock);
+				locktcpsock = -1;
+			}
+		}
+
+		/* IPv6 */
+		if ((locktcp6sock = socket(AF_INET6, SOCK_STREAM, 0)) < 0)
+			syslog(LOG_ERR, "can't create TCP IPv6 socket: %s (%d)", strerror(errno), errno);
+		if (locktcp6sock >= 0) {
+			if (setsockopt(locktcp6sock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0)
+				syslog(LOG_WARNING, "setsockopt TCP IPv6 SO_REUSEADDR: %s (%d)", strerror(errno), errno);
+			setsockopt(locktcp6sock, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on));
+			sin6->sin6_family = AF_INET6;
+			sin6->sin6_addr = in6addr_any;
+			sin6->sin6_port = htons(config.port);
+			sin6->sin6_len = sizeof(*sin6);
+			if (bindresvport_sa(locktcp6sock, (struct sockaddr *)sin6) < 0) {
+				syslog(LOG_ERR, "can't bind TCP IPv6 addr: %s (%d)", strerror(errno), errno);
+				close(locktcp6sock);
+				locktcp6sock = -1;
+			}
+		}
+		if (locktcp6sock >= 0) {
+			socklen = sizeof(*sin6);
+			if (getsockname(locktcp6sock, (struct sockaddr *)sin6, &socklen)) {
+				syslog(LOG_ERR, "can't getsockname on TCP IPv6 socket: %s (%d)", strerror(errno), errno);
+				close(locktcp6sock);
+				locktcp6sock = -1;
+			} else {
+				tcp6port = ntohs(sin6->sin6_port);
+			}
+		}
+		if ((locktcp6sock >= 0) && ((transp = svctcp_create(locktcp6sock, 0, 0)) == NULL)) {
+			syslog(LOG_ERR, "cannot create TCP IPv6 service");
+			close(locktcp6sock);
+			locktcp6sock = -1;
+		}
+		if (locktcp6sock >= 0) {
+			svcregcnt = 0;
+			if (!svc_register(transp, NLM_PROG, NLM_SM, nlm_prog_0, IPPROTO_TCP))
+				syslog(LOG_ERR, "unable to register IPv6 (NLM_PROG, NLM_SM, tcp)");
+			else
+				svcregcnt++;
+			if (!svc_register(transp, NLM_PROG, NLM_VERS, nlm_prog_1, IPPROTO_TCP))
+				syslog(LOG_ERR, "unable to register IPv6 (NLM_PROG, NLM_VERS, tcp)");
+			else
+				svcregcnt++;
+			if (!svc_register(transp, NLM_PROG, NLM_VERSX, nlm_prog_3, IPPROTO_TCP))
+				syslog(LOG_ERR, "unable to register IPv6 (NLM_PROG, NLM_VERSX, tcp)");
+			else
+				svcregcnt++;
+			if (!svc_register(transp, NLM_PROG, NLM_VERS4, nlm_prog_4, IPPROTO_TCP))
+				syslog(LOG_ERR, "unable to register IPv6 (NLM_PROG, NLM_VERS4, tcp)");
+			else
+				svcregcnt++;
+			if (!svcregcnt) {
+				svc_destroy(transp);
+				close(locktcp6sock);
+				locktcp6sock = -1;
+			}
+		}
+
 	}
-	inetaddr.sin_family = AF_INET;
-	inetaddr.sin_addr.s_addr = INADDR_ANY;
-	inetaddr.sin_port = htons(config.port);
-	inetaddr.sin_len = sizeof(inetaddr);
-	if (bindresvport_sa(sockfd, (struct sockaddr *) &inetaddr) < 0) {
-		syslog(LOG_ERR, "can't bind TCP addr: %s (%d)", strerror(errno), errno);
-		exit(1);
-	}
-	socklen = sizeof(inetaddr);
-	if (getsockname(sockfd, (struct sockaddr *) &inetaddr, &socklen))
-		syslog(LOG_ERR, "can't getsockname on TCP socket: %s (%d)", strerror(errno), errno);
-	else
-		tcpport = ntohs(inetaddr.sin_port);
-	transp = svctcp_create(sockfd, 0, 0);
-	if (transp == NULL) {
-		syslog(LOG_ERR, "cannot create TCP service");
-		exit(1);
-	}
-	if (!svc_register(transp, NLM_PROG, NLM_SM, nlm_prog_0, IPPROTO_TCP)) {
-		syslog(LOG_ERR, "unable to register (NLM_PROG, NLM_SM, tcp)");
-		exit(1);
-	}
-	if (!svc_register(transp, NLM_PROG, NLM_VERS, nlm_prog_1, IPPROTO_TCP)) {
-		syslog(LOG_ERR, "unable to register (NLM_PROG, NLM_VERS, tcp)");
-		exit(1);
-	}
-	if (!svc_register(transp, NLM_PROG, NLM_VERSX, nlm_prog_3, IPPROTO_TCP))   {
-		syslog(LOG_ERR, "unable to register (NLM_PROG, NLM_VERSX, tcp)");
-		exit(1);
-	}
-	if (!svc_register(transp, NLM_PROG, NLM_VERS4, nlm_prog_4, IPPROTO_TCP))    {
-		syslog(LOG_ERR, "unable to register (NLM_PROG, NLM_VERS4, tcp)");
+
+	if ((lockudp6sock < 0) && (locktcp6sock < 0))
+		syslog(LOG_WARNING, "Can't create NLM IPv6 sockets");
+	if ((lockudpsock < 0) && (locktcpsock < 0))
+		syslog(LOG_WARNING, "Can't create NLM IPv4 sockets");
+	if ((lockudp6sock < 0) && (locktcp6sock < 0) &&
+	    (lockudpsock < 0) && (locktcpsock < 0)) {
+		syslog(LOG_ERR, "Can't create any NLM sockets!");
 		exit(1);
 	}
 
@@ -390,7 +569,7 @@ main(argc, argv)
 		syslog(LOG_WARNING, "getrlimit(RLIMIT_NOFILE) failed: %s",
 			strerror(errno));
 	} else {
-		rlp.rlim_cur = MIN(rlp.rlim_max, OPEN_MAX);
+		rlp.rlim_cur = MIN(rlp.rlim_max, 2*FD_SETSIZE);
 		if (setrlimit(RLIMIT_NOFILE, &rlp)) {
 			syslog(LOG_WARNING, "setrlimit(RLIMIT_NOFILE) failed: %s",
 				strerror(errno));
@@ -500,15 +679,15 @@ handle_sig_cleanup(int sig)
 		kill(pid, SIGTERM);
 		wait4(pid, &status, 0, NULL);
 	} else {
-		alarm(1); /* XXX 5028243 in case pmap_unset() gets hung up during shutdown */
-		pmap_unset(NLM_PROG, NLM_SM);
-		pmap_unset(NLM_PROG, NLM_VERS);
-		pmap_unset(NLM_PROG, NLM_VERSX);
-		pmap_unset(NLM_PROG, NLM_VERS4);
+		alarm(1); /* XXX 5028243 in case rpcb_unset() gets hung up during shutdown */
+		rpcb_unset(NULL, NLM_PROG, NLM_SM);
+		rpcb_unset(NULL, NLM_PROG, NLM_VERS);
+		rpcb_unset(NULL, NLM_PROG, NLM_VERSX);
+		rpcb_unset(NULL, NLM_PROG, NLM_VERS4);
 	}
-	if (pfh)
+	if (pfh && !sig)
 		pidfile_remove(pfh);
-	exit((sig == SIGTERM) ? 0 : 1);
+	exit(!sig ? 0 : 1);
 }
 
 /*
@@ -527,7 +706,7 @@ handle_sigchld(int sig __unused)
 		if (status)
 			syslog(LOG_ERR, "lockd server %d failed with status %d",
 				pid, WEXITSTATUS(status));
-		handle_sig_cleanup(0);
+		handle_sig_cleanup(SIGCHLD);
 		/*NOTREACHED*/
 	}
 }
@@ -543,15 +722,14 @@ my_svc_run(void)
 	struct timeval now;
 	int error;
 	int hashosts = 0;
-	int tsize = 0;
 	struct timeval *top;
+	extern int svc_maxfd;
 
 
 	for( ;; ) {
 		timeout.tv_sec = config.host_monitor_cache_timeout + 1;
 		timeout.tv_usec = 0;
 
-		tsize = getdtablesize();
 		bcopy(&svc_fdset, &readfds, sizeof(svc_fdset));
 		/*
 		 * If there are any expired hosts then sleep with a
@@ -561,7 +739,7 @@ my_svc_run(void)
 			top = &timeout;
 		else
 			top = NULL;
-		error = select(tsize, &readfds, NULL, NULL, top);
+		error = select(svc_maxfd+1, &readfds, NULL, NULL, top);
 		if (error == -1) {
 			if (errno == EINTR)
 				continue;
@@ -624,15 +802,26 @@ config_read(struct nfs_conf_lockd *conf)
 			syslog(LOG_DEBUG, "%4ld %s=%s (%d)\n", linenum, key, value ? value : "", val);
 
 		if (!strcmp(key, "nfs.lockd.grace_period")) {
-			conf->grace_period = val;
+			if (value && val)
+				conf->grace_period = val;
 		} else if (!strcmp(key, "nfs.lockd.host_monitor_cache_timeout")) {
-			conf->host_monitor_cache_timeout = val;
+			if (value)
+				conf->host_monitor_cache_timeout = val;
 		} else if (!strcmp(key, "nfs.lockd.port")) {
-			conf->port = val;
+			if (value && val)
+				conf->port = val;
+		} else if (!strcmp(key, "nfs.lockd.send_using_tcp")) {
+			conf->send_using_tcp = val;
 		} else if (!strcmp(key, "nfs.lockd.shutdown_delay_client")) {
-			conf->shutdown_delay_client = val;
+			if (value && val)
+				conf->shutdown_delay_client = val;
 		} else if (!strcmp(key, "nfs.lockd.shutdown_delay_server")) {
-			conf->shutdown_delay_server = val;
+			if (value && val)
+				conf->shutdown_delay_server = val;
+		} else if (!strcmp(key, "nfs.lockd.tcp")) {
+			conf->tcp = val;
+		} else if (!strcmp(key, "nfs.lockd.udp")) {
+			conf->udp = val;
 		} else if (!strcmp(key, "nfs.lockd.verbose")) {
 			conf->verbose = val;
 		} else {

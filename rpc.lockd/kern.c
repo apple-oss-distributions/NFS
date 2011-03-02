@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2002-2008 Apple Inc.  All rights reserved.
+ * Copyright (c) 2002-2010 Apple Inc.  All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  * 
@@ -73,7 +73,7 @@
 #include <signal.h>
 #include <netdb.h>
 
-#include "rpcsvc/nlm_prot.h"
+#include "nlm_prot.h"
 #include <nfs/rpcv2.h>
 #include <nfs/nfsproto.h>
 #include <nfs/nfs_lock.h>
@@ -113,8 +113,8 @@ static OWNER owner;
 
 static char hostname[MAXHOSTNAMELEN + 1];	/* Hostname. */
 
-static time_t shutdown_time_client = 1;
-static time_t shutdown_time_server = 1;
+static time_t shutdown_time_client = 0;
+static time_t shutdown_time_server = 0;
 
 static void	set_auth(CLIENT *cl, struct xucred *ucred);
 int	lock_request(LOCKD_MSG *);
@@ -181,7 +181,7 @@ shutdown_timer(void)
 	/* shut down statd too */
 	statd_stop();
 
-	handle_sig_cleanup(SIGTERM);
+	handle_sig_cleanup(0);
 	/*NOTREACHED*/
 }
 
@@ -308,12 +308,6 @@ svc_lockd_shutdown(mach_port_t mp __attribute__((unused)))
 		return (KERN_FAILURE);
 	}
 
-	if ((shutdown_time_client == 1) && (shutdown_time_server == 1)) {
-		/* both times have their init values - were we started by a shutdown request? */
-		syslog(LOG_INFO, "lockd_shutdown: spurious wakeup? %d %d %d", mounts, servers, maxservers);
-		return (KERN_FAILURE);
-	}
-
 	gettimeofday(&now, NULL);
 
 	if ((!servers || !maxservers) && !shutdown_time_server) {
@@ -369,6 +363,10 @@ client_mach_request(void)
 #endif
 	struct sigaction sigalarm;
 	kern_return_t kr;
+	int mounts, servers, maxservers;
+	struct timeval now;
+	time_t shutdown_time;
+	unsigned int delay;
 
 	/*
 	 * Check in with launchd to get the receive right.
@@ -398,11 +396,34 @@ client_mach_request(void)
 		    strerror(errno));
 	}
 
-	/*
-	 * Set the shutdown timer to go off in a minute, just in case
-	 * we've somehow been spuriously woken up with a shutdown request.
-	 */
-	alarm(60);
+	/* Check the current status of the NFS server and NFS mounts */
+	gettimeofday(&now, NULL);
+	mounts = servers = maxservers = 0;
+	if (get_client_and_server_state(&mounts, &servers, &maxservers))
+		syslog(LOG_ERR, "lockd setup: sysctl failed");
+
+	if (!servers || !maxservers) {
+		/* nfsd is not running, set server shutdown time */
+		shutdown_time_server = now.tv_sec + config.shutdown_delay_server;
+	} else {
+		shutdown_time_server = 0;
+	}
+	if (!mounts) {
+		/* no NFS mounts, set client shutdown time */
+		shutdown_time_client = now.tv_sec + config.shutdown_delay_client;
+	} else {
+		shutdown_time_client = 0;
+	}
+
+	if (shutdown_time_client && shutdown_time_server) {
+		/* No server and no mounts, so plan for shutdown. */
+		/* Figure out when the timer should go off. */
+		shutdown_time = MAX(shutdown_time_client, shutdown_time_server);
+		delay = shutdown_time - now.tv_sec;
+		syslog(LOG_DEBUG, "lockd setup: no client or server, arm timer, delay %d", delay);
+		/* arm the timer */
+		alarm(delay);
+	}
 
 #if 0
 	pthread_attr_init(attr);
@@ -466,7 +487,7 @@ test_request(LOCKD_MSG *msg)
 		arg4.alock.l_offset = msg->lm_fl.l_start;
 		arg4.alock.l_len = msg->lm_fl.l_len;
 
-		if ((cli = get_client((struct sockaddr *)&msg->lm_addr, NLM_VERS4, 1)) == NULL)
+		if ((cli = get_client((struct sockaddr *)&msg->lm_addr, NLM_VERS4, 1, (msg->lm_flags & LOCKD_MSG_TCP))) == NULL)
 			return (1);
 
 		set_auth(cli, &msg->lm_cred);
@@ -487,7 +508,7 @@ test_request(LOCKD_MSG *msg)
 		arg.alock.l_offset = msg->lm_fl.l_start;
 		arg.alock.l_len = msg->lm_fl.l_len;
 
-		if ((cli = get_client((struct sockaddr *)&msg->lm_addr, NLM_VERS, 1)) == NULL)
+		if ((cli = get_client((struct sockaddr *)&msg->lm_addr, NLM_VERS, 1, (msg->lm_flags & LOCKD_MSG_TCP))) == NULL)
 			return (1);
 
 		set_auth(cli, &msg->lm_cred);
@@ -511,7 +532,8 @@ lock_request(LOCKD_MSG *msg)
 	char dummy;
 
 	if (d_calls)
-		syslog(LOG_DEBUG, "lock request: %s: %s to %s",
+		syslog(LOG_DEBUG, "lock request: %s %s: %s to %s",
+		    (msg->lm_flags & LOCKD_MSG_RECLAIM) ? "RECLAIM" : "",
 		    (msg->lm_flags & LOCKD_MSG_NFSV3) ? "V4" : "V1/3",
 		    msg->lm_fl.l_type == F_WRLCK ? "write" : "read",
 		    from_addr((struct sockaddr *)&msg->lm_addr));
@@ -531,10 +553,10 @@ lock_request(LOCKD_MSG *msg)
 		arg4.alock.svid = msg->lm_fl.l_pid;
 		arg4.alock.l_offset = msg->lm_fl.l_start;
 		arg4.alock.l_len = msg->lm_fl.l_len;
-		arg4.reclaim = 0;
+		arg4.reclaim = (msg->lm_flags & LOCKD_MSG_RECLAIM) ? 1 : 0;
 		arg4.state = nsm_state;
 
-		if ((cli = get_client((struct sockaddr *)&msg->lm_addr, NLM_VERS4, 1)) == NULL)
+		if ((cli = get_client((struct sockaddr *)&msg->lm_addr, NLM_VERS4, 1+arg4.reclaim, (msg->lm_flags & LOCKD_MSG_TCP))) == NULL)
 			return (1);
 
 		set_auth(cli, &msg->lm_cred);
@@ -553,10 +575,10 @@ lock_request(LOCKD_MSG *msg)
 		arg.alock.svid = msg->lm_fl.l_pid;
 		arg.alock.l_offset = msg->lm_fl.l_start;
 		arg.alock.l_len = msg->lm_fl.l_len;
-		arg.reclaim = 0;
+		arg.reclaim = (msg->lm_flags & LOCKD_MSG_RECLAIM) ? 1 : 0;
 		arg.state = nsm_state;
 
-		if ((cli = get_client((struct sockaddr *)&msg->lm_addr, NLM_VERS, 1)) == NULL)
+		if ((cli = get_client((struct sockaddr *)&msg->lm_addr, NLM_VERS, 1+arg.reclaim, (msg->lm_flags & LOCKD_MSG_TCP))) == NULL)
 			return (1);
 
 		set_auth(cli, &msg->lm_cred);
@@ -599,7 +621,7 @@ cancel_request(LOCKD_MSG *msg)
 		arg4.alock.l_offset = msg->lm_fl.l_start;
 		arg4.alock.l_len = msg->lm_fl.l_len;
 
-		if ((cli = get_client((struct sockaddr *)&msg->lm_addr, NLM_VERS4, 1)) == NULL)
+		if ((cli = get_client((struct sockaddr *)&msg->lm_addr, NLM_VERS4, 1, (msg->lm_flags & LOCKD_MSG_TCP))) == NULL)
 			return (1);
 
 		set_auth(cli, &msg->lm_cred);
@@ -619,7 +641,7 @@ cancel_request(LOCKD_MSG *msg)
 		arg.alock.l_offset = msg->lm_fl.l_start;
 		arg.alock.l_len = msg->lm_fl.l_len;
 
-		if ((cli = get_client((struct sockaddr *)&msg->lm_addr, NLM_VERS, 1)) == NULL)
+		if ((cli = get_client((struct sockaddr *)&msg->lm_addr, NLM_VERS, 1, (msg->lm_flags & LOCKD_MSG_TCP))) == NULL)
 			return (1);
 
 		set_auth(cli, &msg->lm_cred);
@@ -659,7 +681,7 @@ unlock_request(LOCKD_MSG *msg)
 		arg4.alock.l_offset = msg->lm_fl.l_start;
 		arg4.alock.l_len = msg->lm_fl.l_len;
 
-		if ((cli = get_client((struct sockaddr *)&msg->lm_addr, NLM_VERS4, 1)) == NULL)
+		if ((cli = get_client((struct sockaddr *)&msg->lm_addr, NLM_VERS4, 1, (msg->lm_flags & LOCKD_MSG_TCP))) == NULL)
 			return (1);
 
 		set_auth(cli, &msg->lm_cred);
@@ -677,7 +699,7 @@ unlock_request(LOCKD_MSG *msg)
 		arg.alock.l_offset = msg->lm_fl.l_start;
 		arg.alock.l_len = msg->lm_fl.l_len;
 
-		if ((cli = get_client((struct sockaddr *)&msg->lm_addr, NLM_VERS, 1)) == NULL)
+		if ((cli = get_client((struct sockaddr *)&msg->lm_addr, NLM_VERS, 1, (msg->lm_flags & LOCKD_MSG_TCP))) == NULL)
 			return (1);
 
 		set_auth(cli, &msg->lm_cred);
