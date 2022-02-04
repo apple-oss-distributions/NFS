@@ -58,7 +58,6 @@
 
 #include <sys/param.h>
 #include <sys/mount.h>
-#include <sys/socket.h>
 #include <sys/socketvar.h>
 #include <sys/un.h>
 #include <sys/stat.h>
@@ -86,34 +85,21 @@
 
 #include <oncrpc/rpc.h>
 
-#include <nfs/rpcv2.h>
-#include <nfs/nfsproto.h>
-#include <nfs/nfs.h>
 #define _NFS_XDR_SUBS_FUNCS_ /* define this to get xdrbuf function definitions */
 #include <nfs/xdr_subs.h>
 
 #include <TargetConditionals.h>
 
+#include "mount_nfs.h"
+
 
 #define _PATH_NFS_CONF	"/etc/nfs.conf"
-struct nfs_conf_client {
-	int access_cache_timeout;
-	int access_for_getattr;
-	int allow_async;
-	int callback_port;
-	int initialdowndelay;
-	int iosize;
-	int nextdowndelay;
-	int nfsiod_thread_max;
-	int statfs_rate_limit;
-	int is_mobile;
-	int squishy_flags;
-	int root_steals_gss_context;
-	char *default_nfs4domain;
-};
+
 /* init to invalid values so we will only set values specified in nfs.conf */
 struct nfs_conf_client config =
 {
+	-1,
+	-1,
 	-1,
 	-1,
 	-1,
@@ -280,31 +266,7 @@ int retrycnt = -1;
 int zdebug = 0;		/* Turn on testing flag to make kernel prepend '@' to realm */
 
 /* mount options */
-struct {
-	int		mntflags;				/* MNT_* flags */
-	uint32_t	mattrs[NFS_MATTR_BITMAP_LEN];		/* what attrs are set */
-	uint32_t	mflags_mask[NFS_MFLAG_BITMAP_LEN];	/* what flags are set */
-	uint32_t	mflags[NFS_MFLAG_BITMAP_LEN];		/* set flag values */
-	uint32_t	nfs_version, nfs_minor_version;		/* NFS version */
-	uint32_t	nfs_max_vers, nfs_min_vers;		 /* NFS min and max packed version */
-	uint32_t	rsize, wsize, readdirsize, readahead;	/* I/O values */
-	struct timespec	acregmin, acregmax, acdirmin, acdirmax;	/* attrcache values */
-	uint32_t	lockmode;				/* advisory file locking mode */
-	struct nfs_sec	sec;					/* security flavors */
-	struct nfs_etype etype;					/* Kerberos session key encryption types to use */
-	uint32_t	maxgrouplist;				/* max AUTH_SYS groups */
-	int		socket_type, socket_family;		/* socket info */
-	uint32_t	nfs_port, mount_port;			/* port info */
-	struct timespec	request_timeout;			/* NFS request timeout */
-	uint32_t	soft_retry_count;			/* soft retrans count */
-	struct timespec	dead_timeout;				/* dead timeout value */
-	fhandle_t	fh;					/* initial file handle */
-	char *		realm;					/* realm of the client. use for setting up kerberos creds */
-	char *		principal;				/* inital GSS pincipal */
-	char *		sprinc;					/* principal of the server */
-	char *		local_nfs_port;				/* unix domain address "port" for nfs protocol */
-	char *		local_mount_port;			/* unix domain address "port" for mount protocol */
-} options;
+struct nfs_options_client options;
 
 /* convenience macro for setting a mount flag to a particular value (on/off) */
 #define SETFLAG(F, V) \
@@ -316,22 +278,6 @@ struct {
 			NFS_BITMAP_CLR(options.mflags, F); \
 	} while (0)
 
-/*
- * NFS file system location structures
- */
-struct nfs_fs_server {
-	struct nfs_fs_server *	ns_next;
-	char *			ns_name;	/* name of server */
-	struct addrinfo *	ns_ailist;	/* list of addresses for server */
-};
-struct nfs_fs_location {
-	struct nfs_fs_location *nl_next;
-	struct nfs_fs_server *	nl_servers;	/* list of server pointers */
-	char *			nl_path;	/* file system path */
-	uint32_t		nl_servcnt;	/* # servers in list */
-};
-
-
 #define AOK	(void *)	// assert alignment is OK
 
 /* function prototypes */
@@ -340,20 +286,23 @@ void		dump_mount_options(struct nfs_fs_location *, char *);
 void		set_krb5_sec_flavor_for_principal(void);
 void		handle_mntopts(char *);
 void		warn_badoptions(char *);
-int		config_read(struct nfs_conf_client *);
 void		config_sysctl(void);
-int		parse_fs_locations(const char *, struct nfs_fs_location **);
 int		getaddresslist(struct nfs_fs_server *);
-void		getaddresslists(struct nfs_fs_location *, int *);
 void		freeaddresslists(struct nfs_fs_location *);
 int		assemble_mount_args(struct nfs_fs_location *, char **);
 void		usage(void);
 int		nfsparsevers(const char *, uint32_t *, uint32_t *);
-int		hexstr2fh(const char *, fhandle_t *);
 char *		fh2hexstr(fhandle_t *);
 enum clnt_stat	ping_rpc_statd(struct sockaddr *);
+void		nfs_err(int, const char *, ...);
 
-#define MAX_IO_SIZE (8 * 64 * PAGE_SIZE)
+/*
+ * Max rwsize supported by kernel/kext is 2MB for Intel and 8MB for Apple Silicon (8 * 64 * PAGE_SIZE) but
+ * TCP socket buffer limits us to ~3.5MB (3727872 bytes).
+ * We are currently limiting is to 2MB for reasons of consistency.
+ * See Radar #73264615 for more info.
+ */
+#define MAX_IO_SIZE (1024 * 1024 * 2)
 
 uint32_t
 strtouint32(const char *str, char **eptr, int base)
@@ -368,27 +317,52 @@ strtouint32(const char *str, char **eptr, int base)
 	return ((uint32_t)num);
 }
 
-int
-main(int argc, char *argv[])
+void
+nfs_err(int error, const char *fmt,...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	if (options.mntflags & MNT_AUTOMOUNTED) {
+		va_list ap2;
+		va_copy(ap2, ap);
+		vsyslog(LOG_ERR, fmt, ap2);
+		va_end(ap2);
+	}
+
+	verrx(error, fmt, ap);
+	va_end(ap);
+}
+
+void
+setup_switches(void)
 {
 	uint i;
+
+	mopts_switches_no = malloc(sizeof(mopts_switches));
+	if (!mopts_switches_no)
+		nfs_err(ENOMEM, "memory allocation failed");
+	bcopy(mopts_switches, mopts_switches_no, sizeof(mopts_switches));
+	for (i=0; i < sizeof(mopts_switches)/sizeof(struct mntopt); i++)
+		mopts_switches_no[i].m_inverse = (mopts_switches[i].m_inverse == 0);
+}
+
+int
+mount_nfs_imp(int argc, char *argv[])
+{
 	int c, error, try, delay, servcnt;
 	uint32_t num;
 	char mntonname[MAXPATHLEN];
 	char *p, *xdrbuf = NULL;
 	struct nfs_fs_location *nfsl = NULL;
 
+	bzero(&options, sizeof(options));
+
 	/* set up mopts_switches_no from mopts_switches */
-	mopts_switches_no = malloc(sizeof(mopts_switches));
-	if (!mopts_switches_no)
-		errx(ENOMEM, "memory allocation failed");
-	bcopy(mopts_switches, mopts_switches_no, sizeof(mopts_switches));
-	for (i=0; i < sizeof(mopts_switches)/sizeof(struct mntopt); i++)
-		mopts_switches_no[i].m_inverse = (mopts_switches[i].m_inverse == 0);
+	setup_switches();
 
 	/* initialize and process options */
-	bzero(&options, sizeof(options));
-	config_read(&config);
+	config_read(_PATH_NFS_CONF, &config);
 
 	while ((c = getopt(argc, argv, "234a:bcdF:g:I:iLlmo:Pp:R:r:sTt:Uvw:x:z")) != EOF)
 		switch (c) {
@@ -423,11 +397,11 @@ main(int argc, char *argv[])
 			int fd;
 			ssize_t len;
 			if ((fd = open(optarg, O_RDONLY)) < 0)
-				err(errno, "could not open file containing file system specification: %s", optarg);
+				nfs_err(errno, "could not open file containing file system specification: %s: %s", optarg, strerror(errno));
 			if ((mntfromarg = malloc(MAXPATHLEN)) == NULL)
-				errx(ENOMEM, "memory allocation failed");
+				nfs_err(ENOMEM, "memory allocation failed");
 			if ((len = read(fd, mntfromarg, MAXPATHLEN-1)) < 0)
-				err(errno, "could not read file containing file system specification: %s", optarg);
+				nfs_err(errno, "could not read file containing file system specification: %s: %s", optarg, strerror(errno));
 			mntfromarg[len--] = '\0';
 			while (isspace(mntfromarg[len]))
 				mntfromarg[len--] = '\0';
@@ -474,7 +448,7 @@ main(int argc, char *argv[])
 		case 'p':
 			options.principal = strdup(optarg);
 			if (!options.principal)
-				err(1, "could not set principal");
+				nfs_err(1, "could not set principal: %s", strerror(1));
 			NFS_BITMAP_SET(options.mattrs, NFS_MATTR_PRINCIPAL);
 			break;
 		case 'R':
@@ -581,7 +555,7 @@ main(int argc, char *argv[])
 	 */
 	if ((argc == 1) && !strcmp(argv[0], "configupdate")) {
 		if (geteuid() != 0)
-			errx(1, "Must be superuser to configupdate");
+			nfs_err(1, "Must be superuser to configupdate");
 		config_sysctl();
 		exit(0);
 	}
@@ -595,9 +569,9 @@ main(int argc, char *argv[])
 
 	if (realpath(*argv, mntonname) == NULL) {
 		if (errno) {
-			err(errno, "realpath %s", mntonname);
+			nfs_err(errno, "realpath %s: %s", mntonname, strerror(errno));
 		} else {
-			errx(1, "realpath %s", mntonname);
+			nfs_err(1, "realpath %s", mntonname);
 		}
 	}
 
@@ -605,8 +579,7 @@ main(int argc, char *argv[])
 	if (error || !nfsl) {
 		if (!error)
 			error = EINVAL;
-		warnx("could not parse file system specification");
-		exit(error);
+		nfs_err(error, "could not parse file system specification");
 	}
 
 	if (retrycnt < 0)
@@ -622,7 +595,7 @@ main(int argc, char *argv[])
 				#pragma clang diagnostic push
 				#pragma clang diagnostic ignored "-Wdeprecated-declarations"
 				if (daemon(0, 0))
-					errc(errno, errno, "mount nfs background: fork failed");
+					nfs_err(errno, "mount nfs background: fork failed: %s", strerror(errno));
 				#pragma clang diagnostic pop
 				opflags |= ISBGRND;
 			}
@@ -647,12 +620,12 @@ main(int argc, char *argv[])
 
 		/* assemble mount arguments */
 		if ((error = assemble_mount_args(nfsl, &xdrbuf)))
-			errc(error, error, "error %d assembling mount args\n", error);
+			nfs_err(error, "error %d assembling mount args: %s", strerror(error));
 
 		/* mount the file system */
 		if (verbose > 2)
 			printf("Calling mount(\"nfs\", %8.8x, %p)\n", options.mntflags, xdrbuf);
-#ifdef TARGET_OS_IOS
+#if TARGET_OS_IOS
 		if (options.mntflags & MNT_SYNCHRONOUS)
 		{
 			options.mntflags &= ~MNT_SYNCHRONOUS;
@@ -666,7 +639,7 @@ main(int argc, char *argv[])
 			/* NFSv3: mount_nfs should fail when server is not running rpc.statd */
 			if (!NFS_BITMAP_ISSET(options.mattrs, NFS_MATTR_NFS_VERSION) || options.nfs_version < NFS_VER4) {
 				if (ping_rpc_statd(nfsl->nl_servers->ns_ailist->ai_addr) == RPC_PROGNOTREGISTERED) {
-					errc(error, error, "can't mount with remote locks when server (%s) is not running rpc.statd", nfsl->nl_servers->ns_name);
+					nfs_err(error, "can't mount with remote locks when server (%s) is not running rpc.statd: %s", nfsl->nl_servers->ns_name, strerror(error));
 					/*NOTREACHED*/
 					break;
 				}
@@ -689,7 +662,7 @@ main(int argc, char *argv[])
 				break;
 			default:
 				/* give up */
-				errc(error, error, "can't mount %s from %s onto %s", nfsl->nl_path, nfsl->nl_servers->ns_name, mntonname);
+				nfs_err(error, "can't mount %s from %s onto %s: %s", nfsl->nl_path, nfsl->nl_servers->ns_name, mntonname, strerror(error));
 				/*NOTREACHED*/
 				break;
 			}
@@ -707,9 +680,14 @@ main(int argc, char *argv[])
 	}
 
 	if (error)
-		errc(error, error, "can't mount %s from %s onto %s", nfsl->nl_path, nfsl->nl_servers->ns_name, mntonname);
+		nfs_err(error, "can't mount %s from %s onto %s: %s", nfsl->nl_path, nfsl->nl_servers->ns_name, mntonname, strerror(error));
 
 	exit(error);
+}
+
+int
+main(int argc, char *argv[]) {
+	return mount_nfs_imp(argc, argv);
 }
 
 /*
@@ -999,7 +977,6 @@ assemble_mount_args(struct nfs_fs_location *nfslhead, char **xdrbufp)
 		p = nfsl->nl_path;
 		while (*p && (*p == '/'))
 			p++;
-		numcomps = 0;
 		while (*p) {
 			cp = p;
 			while (*p && (*p != '/'))
@@ -1165,7 +1142,7 @@ setNFSVersion(uint32_t pminvers, uint32_t pmaxvers)
 static int
 get_sec_flavors(const char *flavorlist_orig, struct nfs_sec *sec_flavs)
 {
-	char *flavorlist;
+	char *flavorlist, *tofree;
 	char *flavor;
 	u_int32_t flav_bits;
 
@@ -1176,7 +1153,7 @@ get_sec_flavors(const char *flavorlist_orig, struct nfs_sec *sec_flavs)
 #define NONE_BIT  0x00000010
 
 	/* try to make a copy of the string so we don't butcher the original */
-	flavorlist = strdup(flavorlist_orig);
+	tofree = flavorlist = strdup(flavorlist_orig);
 	if (!flavorlist)
 		return (ENOMEM);
 
@@ -1225,7 +1202,7 @@ get_sec_flavors(const char *flavorlist_orig, struct nfs_sec *sec_flavs)
 		}
 	}
 
-	free(flavorlist);
+	free(tofree);
 
 	if (sec_flavs->count)
 		return 0;
@@ -1239,7 +1216,7 @@ get_sec_flavors(const char *flavorlist_orig, struct nfs_sec *sec_flavs)
 static int
 get_etypes(const char *etypes_orig, struct nfs_etype *etypes)
 {
-	char *etype_list;
+	char *etype_list, *tofree;
 	char *etype;
 	uint32_t etype_bits;
 
@@ -1248,7 +1225,7 @@ get_etypes(const char *etypes_orig, struct nfs_etype *etypes)
 #define AES256_BIT 0x00000004
 
 	/* try to make a copy of the string so we don't butcher the original */
-	etype_list = strdup(etypes_orig);
+	tofree = etype_list = strdup(etypes_orig);
 	if (!etype_list)
 		return (ENOMEM);
 
@@ -1277,7 +1254,7 @@ get_etypes(const char *etypes_orig, struct nfs_etype *etypes)
 		}
 		else if (!strcasecmp("aes256", etype) ||
 			 !strcasecmp("aes256-cts-hmac-sha1", etype) || !strcasecmp("aes256-cts-hmac-sha1-96", etype)) {
-			if (etype_bits & AES128_BIT) {
+			if (etype_bits & AES256_BIT) {
 				warnx("etype aes256-cts-hmac-sha1-96  appears more than once: %s", etype_list);
 				continue;
 			}
@@ -1288,7 +1265,7 @@ get_etypes(const char *etypes_orig, struct nfs_etype *etypes)
 			warnx("etype %s is unknown etype. Ignored", etype);
 		}
 	}
-	free(etype_list);
+	free(tofree);
 
 	etypes->selected = etypes->count; /* Nothing has been selected, so set selected to count */
 
@@ -1336,7 +1313,11 @@ handle_mntopts(char *opts)
 	altflags = 0;
 	mop = getmntopts(opts, mopts, &options.mntflags, &altflags);
 	if (mop == NULL)
-		errx(EINVAL, "getmntops failed: %s", opts);
+		nfs_err(EINVAL, "getmntops failed: %s", opts);
+
+	if (options.mntflags) {
+		NFS_BITMAP_SET(options.mattrs, NFS_MATTR_MNTFLAGS);
+	}
 
 	if (altflags & ALTF_ATTRCACHE_VAL) {
 		if ((p2 = getmntoptstr(mop, "actimeo"))) {
@@ -1491,7 +1472,7 @@ handle_mntopts(char *opts)
 					options.socket_type = SOCK_STREAM;
 					options.socket_family = AF_INET;
 				}
-			} else if (!strncasecmp(p2, "udp", 4) || strncasecmp(p2, "udp4", 5)) {
+			} else if (!strncasecmp(p2, "udp", 4) || !strncasecmp(p2, "udp4", 5)) {
 				if (options.local_nfs_port || options.local_mount_port)
 					warnx("netid must be ticotsord or ticlts when specifing local socket ports");
 				else {
@@ -1650,7 +1631,7 @@ handle_mntopts(char *opts)
 			if (options.principal) {
 				NFS_BITMAP_SET(options.mattrs, NFS_MATTR_PRINCIPAL);
 			} else
-				err(1, "could not set principal");
+				nfs_err(1, "could not set principal: %s", strerror(1));
 		}
 	}
 	if (altflags & ALTF_REALM) {
@@ -1665,7 +1646,7 @@ handle_mntopts(char *opts)
 			if (options.realm)
 				NFS_BITMAP_SET(options.mattrs, NFS_MATTR_REALM);
 			else
-				err(1, "could not set realm");
+				nfs_err(1, "could not set realm: %s", strerror(1));
 		}
 	}
 	if (altflags & ALTF_SVCPRINCIPAL) {
@@ -1677,7 +1658,7 @@ handle_mntopts(char *opts)
 			if (options.sprinc)
 				NFS_BITMAP_SET(options.mattrs, NFS_MATTR_SVCPRINCIPAL);
 			else
-				err(1, "could not set server's principal");
+				nfs_err(1, "could not set server's principal: %s", strerror(1));
 		}
 	}
 	if (altflags & ALTF_FH) {
@@ -1694,7 +1675,7 @@ handle_mntopts(char *opts)
 				}
 			}
 			else
-				err(1, "cound not set root file handle");
+				nfs_err(1, "cound not set root file handle: %s", strerror(1));
 		}
 	}
 	freemntopts(mop);
@@ -1703,7 +1684,7 @@ handle_mntopts(char *opts)
 	altflags = 0;
 	mop = getmntopts(opts, mopts_switches, &dummyflags, &altflags);
 	if (mop == NULL)
-		errx(EINVAL, "getmntops failed: %s", opts);
+		nfs_err(EINVAL, "getmntops failed: %s", opts);
 	if (verbose > 2)
 		printf("altflags=0x%x\n", altflags);
 
@@ -1776,7 +1757,7 @@ handle_mntopts(char *opts)
 	altflags = 0;
 	mop = getmntopts(opts, mopts_switches_no, &dummyflags, &altflags);
 	if (mop == NULL)
-		errx(EINVAL, "getmntops failed: %s", opts);
+		nfs_err(EINVAL, "getmntops failed: %s", opts);
 	if (verbose > 2)
 		printf("negative altflags=0x%x\n", altflags);
 
@@ -1804,6 +1785,8 @@ handle_mntopts(char *opts)
 		SETFLAG(NFS_MFLAG_NOCALLBACK, 1);
 	if (altflags & ALTF_CONN)
 		SETFLAG(NFS_MFLAG_NOCONNECT, 1);
+	if (altflags & ALTF_NOOPAQUE_AUTH)
+		SETFLAG(NFS_MFLAG_NOOPAQUE_AUTH, 0);
 	if (altflags & ALTF_DUMBTIMR)
 		SETFLAG(NFS_MFLAG_DUMBTIMER, 0);
 	if (altflags & ALTF_HARD)
@@ -1827,7 +1810,7 @@ handle_mntopts(char *opts)
 	if (altflags & ALTF_MUTEJUKEBOX)
 		SETFLAG(NFS_MFLAG_MUTEJUKEBOX, 0);
 	if (altflags & ALTF_NAMEDATTR)
-		SETFLAG(NFS_MFLAG_NAMEDATTR, 1);
+		SETFLAG(NFS_MFLAG_NAMEDATTR, 0);
 	if (altflags & ALTF_NEGNAMECACHE)
 		SETFLAG(NFS_MFLAG_NONEGNAMECACHE, 1);
 	if (altflags & ALTF_NFC)
@@ -1845,6 +1828,9 @@ handle_mntopts(char *opts)
 	if (altflags & ALTF_UDP) /* noudp = tcp */
 		options.socket_type = SOCK_STREAM;
 	freemntopts(mop);
+
+	if (options.socket_type || options.socket_family)
+		NFS_BITMAP_SET(options.mattrs, NFS_MATTR_SOCKET_TYPE);
 
 	warn_badoptions(opts);
 }
@@ -1896,16 +1882,16 @@ warn_badoptions(char *opts)
  * read the NFS client values from nfs.conf
  */
 int
-config_read(struct nfs_conf_client *conf)
+config_read(const char *confpath, struct nfs_conf_client *conf)
 {
 	FILE *f;
 	size_t len, linenum = 0;
 	char *line, *p, *key, *value;
 	long val;
 
-	if (!(f = fopen(_PATH_NFS_CONF, "r"))) {
+	if (!(f = fopen(confpath, "r"))) {
 		if (errno != ENOENT)
-			warn("%s", _PATH_NFS_CONF);
+			warn("%s", confpath);
 		return (1);
 	}
 	for (; (line = fparseln(f, &len, &linenum, NULL, 0)); free(line)) {
@@ -1975,6 +1961,12 @@ config_read(struct nfs_conf_client *conf)
 			if (value) {
 				conf->default_nfs4domain = strndup(value, MAXPATHLEN);
 			}
+		} else if (!strcmp(key, "nfs.client.mount_timeout")) {
+			if (value && val)
+				conf->mount_timeout = (int)val;
+		} else if (!strcmp(key, "nfs.client.mount_quick_timeout")) {
+			if (value && val)
+				conf->mount_quick_timeout = (int)val;
 		} else {
 			if (verbose)
 				printf("ignoring unknown config value: %4ld %s=%s\n", linenum, key, value ? value : "");
@@ -2104,6 +2096,10 @@ config_sysctl(void)
 		sysctl_set("vfs.generic.nfs.client.squishy_flags", config.squishy_flags);
 	if (config.root_steals_gss_context != -1)
 		sysctl_set("vfs.generic.nfs.client.root_steals_gss_context", config.root_steals_gss_context);
+	if (config.mount_timeout != -1)
+		sysctl_set("vfs.generic.nfs.client.mount_timeout", config.mount_timeout);
+	if (config.mount_quick_timeout != -1)
+		sysctl_set("vfs.generic.nfs.client.mount_quick_timeout", config.mount_quick_timeout);
 	if (config.default_nfs4domain != NULL) {
 		sysctlbyname("vfs.generic.nfs.client.default_nfs4domain", NULL, 0, config.default_nfs4domain, strnlen(config.default_nfs4domain, MAXPATHLEN));
 	}
@@ -2143,9 +2139,10 @@ parse_fs_locations(const char *mntfromarg, struct nfs_fs_location **nfslp)
 	struct nfs_fs_location *nfslhead = NULL;
 	struct nfs_fs_location *nfslprev = NULL;
 	struct nfs_fs_location *nfsl = NULL;
-	struct nfs_fs_server *nfss, *nfssprev;
+	struct nfs_fs_server *nfss = NULL, *nfssprev;
 	struct sockaddr_in6 sin6;
 	char *argcopy, *p, *q, *host, *path, *colon, *colonslash, ch;
+	int error = 0;
 
 	*nfslp = NULL;
 
@@ -2156,16 +2153,20 @@ parse_fs_locations(const char *mntfromarg, struct nfs_fs_location **nfslp)
 
 	while (*p) {
 		/* allocate a new fs location */
-		if (!((nfsl = malloc(sizeof(*nfsl)))))
-			return (ENOMEM);
+		if (!((nfsl = malloc(sizeof(*nfsl))))) {
+			error = ENOMEM;
+			goto outfree;
+		}
 		bzero(nfsl, sizeof(*nfsl));
 		colon = colonslash = NULL;
 
 		/* parse hosts */
 		nfssprev = NULL;
 		while (*p) {
-			if (!((nfss = malloc(sizeof(*nfss)))))
-				return (ENOMEM);
+			if (!((nfss = malloc(sizeof(*nfss))))) {
+				error = ENOMEM;
+				goto outfree;
+			}
 			bzero(nfss, sizeof(*nfss));
 			host = p;
 			if (*p == '[') {  /* Looks like an IPv6 literal address */
@@ -2199,7 +2200,6 @@ parse_fs_locations(const char *mntfromarg, struct nfs_fs_location **nfslp)
 					if (!colon)
 						colon = p;
 					if (!colonslash && (*(p+1) == '/')) {
-						colonslash = p;
 						break;
 					}
 				}
@@ -2209,8 +2209,10 @@ parse_fs_locations(const char *mntfromarg, struct nfs_fs_location **nfslp)
 			}
 			if (!*p) {
 				/* If we hit the end of the string, the host must be the string preceding the colon. */
-				if (!colon) /* No colon?! */
-					return (EINVAL);
+				if (!colon) { /* No colon?! */
+					error = EINVAL;
+					goto outfree;
+				}
 				p = colon;
 			}
 addhost:
@@ -2220,8 +2222,10 @@ addhost:
 			*p = '\0';
 			nfss->ns_name = strdup(host);
 			*p = ch;
-			if (!nfss->ns_name)
-				return (ENOMEM);
+			if (!nfss->ns_name) {
+				error = ENOMEM;
+				goto outfree;
+			}
 			/* Add the host to the list of servers. */
 			if (nfssprev)
 				nfssprev->ns_next = nfss;
@@ -2238,8 +2242,10 @@ addhost:
 		}
 		if (!*p) {
 			/* If we hit the end of the string, the path must be the string following the colon. */
-			if (!colon) /* No colon?! */
-				return (EINVAL);
+			if (!colon) { /* No colon?! */
+				error = EINVAL;
+				goto outfree;
+			}
 			p = colon;
 			p++;
 		}
@@ -2267,8 +2273,8 @@ addhost:
 		nfsl->nl_path = strdup(path);
 		*p = ch;
 		if (!nfsl->nl_path) {
-			free(nfsl);
-			return (ENOMEM);
+			error = ENOMEM;
+			goto outfree;
 		}
 		/* Add the fs location to the list of locations. */
 		if (nfslprev)
@@ -2282,12 +2288,35 @@ addhost:
 			p++;
 	}
 
-	free(argcopy);
-	if (!nfslhead)
-		return (EINVAL);
+	if (!nfslhead) {
+		error = EINVAL;
+		goto outfree;
+	}
 
+	free(argcopy);
 	*nfslp = nfslhead;
 	return (0);
+
+outfree:
+	if (nfsl) {
+		free(nfsl);
+	}
+	if (nfss) {
+		free(nfss);
+	}
+	while (nfslhead) {
+		while (nfslhead->nl_servers) {
+			nfss = nfslhead->nl_servers->ns_next;
+			free(nfslhead->nl_servers);
+			nfslhead->nl_servers = nfss;
+		}
+		nfsl = nfslhead->nl_next;
+		free(nfslhead);
+		nfslhead = nfsl;
+	}
+
+	free(argcopy);
+	return error;
 }
 
 /*
@@ -2328,9 +2357,8 @@ getaddresslist(struct nfs_fs_server *nfss)
 		struct sockaddr_un *un;
 
 		if (*hostname == '<') {
-			hostname = strdup(hostname);
-			if (hostname == NULL)
-				err(1, "No memory to duplicate hostname %s", hostname);
+			strlcpy(namebuf, hostname, sizeof(namebuf));
+			hostname = namebuf;
 			hostname[strlen(hostname)-1] = '\0';
 			hostname += 1;
 		}
@@ -2339,7 +2367,7 @@ getaddresslist(struct nfs_fs_server *nfss)
 			warnx("Can't allocate addrinfo sturcture for local address for %s", hostname);
 			return (ENOMEM);
 		}
-		un = (struct sockaddr_un *)malloc(sizeof (struct sockaddr_un *));
+		un = (struct sockaddr_un *)malloc(sizeof(struct sockaddr_un));
 		if (un == NULL) {
 			free(ailist);
 			warnx("Can't allocate local socket address for %s", hostname);
@@ -2355,7 +2383,9 @@ getaddresslist(struct nfs_fs_server *nfss)
 					warnx("%s overrides port=%s", hostname, options.local_nfs_port);
 				free(options.local_nfs_port);
 			}
-			options.local_nfs_port = hostname;
+			options.local_nfs_port = strdup(hostname);
+			if (options.local_nfs_port == NULL)
+				nfs_err(1, "No memory to duplicate hostname %s: %s", options.local_nfs_port, strerror(1));
 			NFS_BITMAP_SET(options.mattrs, NFS_MATTR_LOCAL_NFS_PORT);
 			if (verbose > 2)
 				printf("Setting local_nfs_port to %s\n", options.local_nfs_port);
@@ -2468,7 +2498,7 @@ discard:
 
 	/* free up any discarded addresses */
 	if (aidiscard)
-		freeaddrinfo(aidiscard);
+		free(aidiscard);
 
 	nfss->ns_ailist = ailist;
 	return (0);
@@ -2719,7 +2749,7 @@ dump_mount_options(struct nfs_fs_location *nfslhead, char *mntonname)
 	if (NFS_BITMAP_ISSET(options.mflags_mask, NFS_MFLAG_RDIRPLUS) || (verbose > 1))
 		printf(",%srdirplus", NFS_BITMAP_ISSET(options.mflags, NFS_MFLAG_RDIRPLUS) ? "" : "no");
 	if (NFS_BITMAP_ISSET(options.mflags_mask, NFS_MFLAG_DUMBTIMER) || (verbose > 1))
-		printf(",%sdumbtimr", NFS_BITMAP_ISSET(options.mflags, NFS_MFLAG_DUMBTIMER) ? "" : "no");
+		printf(",%sdumbtimer", NFS_BITMAP_ISSET(options.mflags, NFS_MFLAG_DUMBTIMER) ? "" : "no");
 	if (NFS_BITMAP_ISSET(options.mattrs, NFS_MATTR_REQUEST_TIMEOUT) || (verbose > 1))
 		printf(",timeo=%ld", NFS_BITMAP_ISSET(options.mattrs, NFS_MATTR_REQUEST_TIMEOUT) ?
 			((options.request_timeout.tv_sec * 10) + (options.request_timeout.tv_nsec % 100000000)) : 10);
