@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1999-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 1999-2023 Apple Inc. All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  *
@@ -56,71 +56,77 @@
  * SUCH DAMAGE.
  */
 
+#include "sm_inter.h"
+
 #import <XCTest/XCTest.h>
 
-#include "nfs_prot_rpc.h"
-
-void
-doNullRPC(CLIENT *clnt)
+sm_stat_res *
+STAT_doStatRPC(CLIENT *clnt, char *name)
 {
-    void *arg = NULL;
-    void *result = NULL;
+	struct sm_name smname = {.mon_name = name};
+	struct sm_stat_res *result = NULL;
 
-    result = nfsproc3_null_3((void*)&arg, clnt);
-    if (result == NULL) {
-        XCTFail("nfsproc_null_2 returned null");
-    }
+	result = sm_stat_1(&smname, clnt);
+	if (result == NULL) {
+		XCTFail("sm_stat_1 returned null");
+	}
+	return result;
 }
 
-GETATTR3res *
-doGetattrRPC(CLIENT *clnt, fhandle_t *fhp)
+sm_stat_res *
+STAT_doMonRPC(CLIENT *clnt, char *mon_name, char *my_name, int my_prog, int my_vers, int my_proc, char *priv)
 {
-    GETATTR3args args = {};
-    GETATTR3res *result = NULL;
+	struct mon_id mon_id = {.mon_name = mon_name,
+		                .my_id = {.my_name = my_name, .my_proc = my_proc, .my_prog = my_prog, .my_vers = my_vers}};
+	struct mon mon = {.mon_id = mon_id, .priv = {0}};
+	strncpy(mon.priv, priv, sizeof(mon.priv));
+	struct sm_stat_res *result = NULL;
 
-    args.object.data.data_len = fhp->fh_len;
-    args.object.data.data_val = (char *)fhp->fh_data;
-
-    result = nfsproc3_getattr_3((void*)&args, clnt);
-    if (result == NULL) {
-        XCTFail("nfsproc3_getattr_3 returned null");
-    }
-
-    return result;
+	result = sm_mon_1(&mon, clnt);
+	if (result == NULL) {
+		XCTFail("sm_mon_1 returned null");
+	}
+	return result;
 }
 
-LOOKUP3res *
-doLookupRPC(CLIENT *clnt, fhandle_t *dfhp, char *name)
+sm_stat *
+STAT_doUnmonRPC(CLIENT *clnt, char *mon_name, char *my_name, int my_prog, int my_vers, int my_proc)
 {
-    LOOKUP3args args = {};
-    LOOKUP3res *result = NULL;
+	struct mon_id mon_id = {.mon_name = mon_name,
+		                .my_id = {.my_name = my_name, .my_proc = my_proc, .my_prog = my_prog, .my_vers = my_vers}};
 
-    args.what.dir.data.data_len = dfhp->fh_len;
-    args.what.dir.data.data_val = (char *)dfhp->fh_data;
-    args.what.name = name;
+	struct sm_stat *result = NULL;
 
-    result = nfsproc3_lookup_3((void*)&args, clnt);
-    if (result == NULL) {
-        XCTFail("nfsproc3_lookup_3 returned null");
-    }
-
-    return result;
+	result = sm_unmon_1(&mon_id, clnt);
+	if (result == NULL) {
+		XCTFail("sm_unmon_1 returned null");
+	}
+	return result;
 }
 
-ACCESS3res *
-doAccessRPC(CLIENT *clnt, fhandle_t *fhp, uint32_t access)
+
+sm_stat *
+STAT_doUnmonAllRPC(CLIENT *clnt, char *mon_name, char *my_name, int my_prog, int my_vers, int my_proc)
 {
-    ACCESS3args args = {};
-    ACCESS3res *result = NULL;
+	struct my_id my_id = {.my_name = my_name, .my_proc = my_proc, .my_prog = my_prog, .my_vers = my_vers};
+	struct sm_stat *result = NULL;
 
-    args.object.data.data_len = fhp->fh_len;;
-    args.object.data.data_val = (char *)fhp->fh_data;
-    args.access = access;
+	result = sm_unmon_all_1(&my_id, clnt);
+	if (result == NULL) {
+		XCTFail("sm_unmon_all_1 returned null");
+	}
+	return result;
+}
 
-    result = nfsproc3_access_3((void*)&args, clnt);
-    if (result == NULL) {
-        XCTFail("nfsproc3_access_3 returned null");
-    }
+sm_stat *
+STAT_doNotifyRPC(CLIENT *clnt, char *mon_name, int state)
+{
+	struct stat_chge stat_chge = {.mon_name = mon_name, .state = state};
+	void *result = NULL;
 
-    return result;
+	result = sm_notify_1(&stat_chge, clnt);
+	if (result == NULL) {
+		XCTFail("sm_notify_1 returned null");
+	}
+	return result;
 }

@@ -6,12 +6,12 @@
 #ifndef _NFS_PROT_H_RPCGEN
 #define _NFS_PROT_H_RPCGEN
 
-#define RPCGEN_VERSION	199506
+#define RPCGEN_VERSION  199506
 
-#include <rpc/rpc.h>
+#include <oncrpc/rpc.h>
 
 #define NFS_PORT 2049
-// #define NFS_MAXDATA 8192
+#define NFS_MAXDATA (1024 * 1024)
 #define NFS_MAXPATHLEN 1024
 #define NFS_MAXNAMLEN 255
 #define NFS_FHSIZE 32

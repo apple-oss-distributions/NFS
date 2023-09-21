@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1999-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 1999-2018 Apple Inc.  All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  *
@@ -21,7 +21,7 @@
  * @APPLE_LICENSE_HEADER_END@
  */
 /*
- * Copyright (c) 1992, 1993, 1994
+ * Copyright (c) 1989, 1993, 1994
  *    The Regents of the University of California.  All rights reserved.
  *
  * This code is derived from software contributed to Berkeley by
@@ -56,32 +56,12 @@
  * SUCH DAMAGE.
  */
 
-#ifndef NFS_PROT_RPC_H
-#define NFS_PROT_RPC_H
+#include <stdio.h>
 
-#include "nfs_prot.h"
+int lockd_imp(int argc, char *argv[], const char *conf_path);
 
-void doNullRPC(CLIENT *clnt);
-GETATTR3res *doGetattrRPC(CLIENT *clnt, nfs_fh3 *object);
-SETATTR3res *doSetattrRPC(CLIENT *clnt, nfs_fh3 *object, sattr3 *new_attributes, struct timespec *guard);
-LOOKUP3res *doLookupRPC(CLIENT *clnt, nfs_fh3 *dir, char *name);
-ACCESS3res *doAccessRPC(CLIENT *clnt, nfs_fh3 *object, uint32_t access);
-READLINK3res *doReadlinkRPC(CLIENT *clnt, nfs_fh3 *symlink);
-READ3res *doReadRPC(CLIENT *clnt, nfs_fh3 *file, offset3 offset, count3 count);
-WRITE3res *doWriteRPC(CLIENT *clnt, nfs_fh3 *file, offset3 offset, count3 count, stable_how stable, u_int data_len, char *data_val);
-CREATE3res *doCreateRPC(CLIENT *clnt, nfs_fh3 *dir, char *name, struct createhow3 *how);
-MKDIR3res *doMkdirRPC(CLIENT *clnt, nfs_fh3 *dir, char *name, sattr3 *attributes);
-SYMLINK3res *doSymlinkRPC(CLIENT *clnt, nfs_fh3 *dir, char *name, sattr3 *symlink_attributes, nfspath3 symlink_data);
-MKNOD3res *doMknodRPC(CLIENT *clnt, nfs_fh3 *where_dir, char *where_name, struct mknoddata3 *what);
-REMOVE3res *doRemoveRPC(CLIENT *clnt, nfs_fh3 *dir, char *name);
-RMDIR3res *doRMDirRPC(CLIENT *clnt, nfs_fh3 *dir, char *name);
-RENAME3res *doRenameRPC(CLIENT *clnt, nfs_fh3 *from_dir, char *from_name, nfs_fh3 *to_dir, char *to_name);
-LINK3res *doLinkRPC(CLIENT *clnt, nfs_fh3 *file, nfs_fh3 *link_dir, char *link_name);
-READDIR3res *doReaddirRPC(CLIENT *clnt, nfs_fh3 *dir, cookie3 cookie, cookieverf3 *cookieverf, count3 count);
-READDIRPLUS3res *doReaddirplusRPC(CLIENT *clnt, nfs_fh3 *dir, cookie3 cookie, cookieverf3 *cookieverf, count3 dircount, count3 maxcount);
-FSSTAT3res *doFSStatRPC(CLIENT *clnt, nfs_fh3 *fsroot);
-FSINFO3res *doFSinfoRPC(CLIENT *clnt, nfs_fh3 *fsroot);
-PATHCONF3res *doPathconfRPC(CLIENT *clnt, nfs_fh3 *object);
-COMMIT3res *doCommitRPC(CLIENT *clnt, nfs_fh3 *file, offset3 offset, count3 count);
-
-#endif /* NFS_PROT_RPC_H */
+int
+main(int argc, char *argv[])
+{
+	return lockd_imp(argc, argv, NULL);
+}
